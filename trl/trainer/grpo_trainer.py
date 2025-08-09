@@ -579,6 +579,23 @@ class GRPOTrainer(Trainer):
         self.vision_start_token_id = getattr(model.config, "vision_start_token_id", None)
         self.vision_end_token_id = getattr(model.config, "vision_end_token_id", None)
 
+        # Pre-compile regex patterns for text processing
+        self._pad_token_pattern = None
+        if self.pad_token:
+            self._pad_token_pattern = re.compile(rf"^({re.escape(self.pad_token)})+")
+
+        self._image_token_patterns = {}
+        if self.image_token is not None:
+            escaped_img_token = re.escape(self.image_token)
+            self._image_token_patterns["collapse"] = re.compile(rf"({escaped_img_token})+")
+            self._image_token_patterns["in_template"] = escaped_img_token in (
+                self.processing_class.chat_template or ""
+            )
+
+            if self.vision_end_token_id is not None:
+                escaped_eoi_token = re.escape(self.processing_class.tokenizer.decode([self.vision_end_token_id]))
+                self._image_token_patterns["with_eoi"] = re.compile(rf"({escaped_img_token})+{escaped_eoi_token}")
+
         # Reward functions
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
@@ -1404,7 +1421,9 @@ class GRPOTrainer(Trainer):
             prompts_text = self.processing_class.batch_decode(
                 prompt_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
             )
-            prompts_text = [re.sub(rf"^({re.escape(self.pad_token)})+", "", text) for text in prompts_text]
+            # Use pre-compiled regex pattern for pad token removal
+            if self._pad_token_pattern:
+                prompts_text = [self._pad_token_pattern.sub("", text) for text in prompts_text]
 
             # The chat template sometimes inserts a single image token into the prompt text. However, when this text is
             # later tokenized, the single image token string is expanded into multiple image token IDs, depending on the
@@ -1413,25 +1432,19 @@ class GRPOTrainer(Trainer):
             # applies it. Otherwise, it assumes that the chat template uses only vision_start_token_id to indicate images
             # (e.g. Gemma 3) and removes all image_token instances and vision_end_token_id as well, leaving only
             # the vision_start_token_id (e.g. <start_of_image>).
-            if self.image_token is not None:
-                escaped_img_token = re.escape(self.image_token)
-                # Search for the image token in the chat template
-                if re.search(escaped_img_token, self.processing_class.chat_template):
+            if self._image_token_patterns:
+                if self._image_token_patterns["in_template"]:
+                    # Collapse repeated image tokens to single token
                     prompts_text = [
-                        re.sub(rf"({escaped_img_token})+", self.image_token, text) for text in prompts_text
+                        self._image_token_patterns["collapse"].sub(self.image_token, text) for text in prompts_text
                     ]
                 else:
                     # If the chat template doesn't use the image token, we remove all instances of it + vision_end_token_id
-                    if self.vision_end_token_id is not None:
-                        escaped_eoi_token = re.escape(
-                            self.processing_class.tokenizer.decode([self.vision_end_token_id])
-                        )
-                        prompts_text = [
-                            re.sub(rf"({escaped_img_token})+{escaped_eoi_token}", "", text) for text in prompts_text
-                        ]
+                    if "with_eoi" in self._image_token_patterns:
+                        prompts_text = [self._image_token_patterns["with_eoi"].sub("", text) for text in prompts_text]
                     else:
                         # If vision_end_token_id is None, just remove the image tokens
-                        prompts_text = [re.sub(rf"({escaped_img_token})+", "", text) for text in prompts_text]
+                        prompts_text = [self._image_token_patterns["collapse"].sub("", text) for text in prompts_text]
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
