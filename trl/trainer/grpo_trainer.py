@@ -391,6 +391,13 @@ class GRPOTrainer(BaseTrainer):
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
+        # Sequence-level clipping parameters for adaptive importance sampling
+        self.sequence_epsilon_low = (
+            args.sequence_epsilon_low if args.sequence_epsilon_low is not None else self.epsilon_low
+        )
+        self.sequence_epsilon_high = (
+            args.sequence_epsilon_high if args.sequence_epsilon_high is not None else self.epsilon_high
+        )
         # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
         self._step = 0
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
@@ -1700,16 +1707,52 @@ class GRPOTrainer(BaseTrainer):
         elif self.importance_sampling_level == "sequence":
             log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
             log_importance_weights = log_importance_weights.unsqueeze(-1)
+        elif self.importance_sampling_level == "adaptive":
+            # Adaptive importance sampling: use token-level for normal tokens, sequence-level for clipped tokens
+            # First compute both token-level and sequence-level ratios
+            token_level_weights = log_ratio
+            sequence_level_weight = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            sequence_level_weights = sequence_level_weight.unsqueeze(-1).expand_as(token_level_weights)
+
+            # Identify tokens that would be clipped at token level
+            token_ratios = torch.exp(token_level_weights)
+            would_be_clipped = (token_ratios < 1 - self.epsilon_low) | (token_ratios > 1 + self.epsilon_high)
+
+            # Use sequence-level for tokens that would be clipped, token-level for normal tokens
+            log_importance_weights = torch.where(
+                would_be_clipped & completion_mask.bool(), sequence_level_weights, token_level_weights
+            )
         else:
             raise ValueError(
-                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
-                "and 'sequence'."
+                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token', "
+                "'sequence', and 'adaptive'."
             )
         # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
         # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
 
         coef_1 = torch.exp(log_importance_weights)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+
+        # Apply appropriate clipping based on importance sampling level
+        if self.importance_sampling_level == "adaptive":
+            # For adaptive mode, we need to apply different clip bounds to different tokens
+            token_ratios = torch.exp(log_ratio)
+            would_be_clipped = (token_ratios < 1 - self.epsilon_low) | (token_ratios > 1 + self.epsilon_high)
+
+            # Create clip bounds based on whether token uses sequence-level or token-level
+            lower_bounds = torch.where(
+                would_be_clipped & completion_mask.bool(),
+                torch.full_like(coef_1, 1 - self.sequence_epsilon_low),
+                torch.full_like(coef_1, 1 - self.epsilon_low),
+            )
+            upper_bounds = torch.where(
+                would_be_clipped & completion_mask.bool(),
+                torch.full_like(coef_1, 1 + self.sequence_epsilon_high),
+                torch.full_like(coef_1, 1 + self.epsilon_high),
+            )
+            coef_2 = torch.min(torch.max(coef_1, lower_bounds), upper_bounds)
+        else:
+            # Standard clipping for token-level and sequence-level modes
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
 
         # Two-sided clipping
         if self.args.delta is not None:
@@ -1777,6 +1820,51 @@ class GRPOTrainer(BaseTrainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+
+        # Log adaptive sampling statistics if applicable
+        if self.importance_sampling_level == "adaptive":
+            # Count how many tokens were switched to sequence-level
+            token_ratios = torch.exp(log_ratio)
+            would_be_token_clipped = (token_ratios < 1 - self.epsilon_low) | (token_ratios > 1 + self.epsilon_high)
+
+            # These tokens were switched to sequence-level
+            switched_to_seq = would_be_token_clipped & completion_mask.bool()
+            adaptive_switch_ratio = masked_batch_mean(switched_to_seq.float())
+            gathered_switch_ratio = self.accelerator.gather(adaptive_switch_ratio)
+            self._metrics[mode]["adaptive_is/switch_to_seq_ratio"].append(gathered_switch_ratio.nanmean().item())
+
+            # Now check which tokens actually got clipped after switching
+            # For tokens using sequence-level, check if sequence-level ratio was clipped
+            sequence_level_weight = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            seq_ratios = torch.exp(sequence_level_weight)
+
+            # Tokens using token-level that got clipped
+            token_level_clipped = ~switched_to_seq & is_region_clipped
+            token_clip_ratio = masked_batch_mean(token_level_clipped.float())
+            gathered_token_clip = self.accelerator.gather(token_clip_ratio)
+            self._metrics[mode]["adaptive_is/token_level_clipped"].append(gathered_token_clip.nanmean().item())
+
+            # Tokens using sequence-level that got clipped
+            seq_would_be_clipped = (seq_ratios < 1 - self.sequence_epsilon_low) | (
+                seq_ratios > 1 + self.sequence_epsilon_high
+            )
+            seq_level_clipped = switched_to_seq & seq_would_be_clipped.unsqueeze(-1).expand_as(completion_mask)
+            seq_clip_ratio = masked_batch_mean(seq_level_clipped.float())
+            gathered_seq_clip = self.accelerator.gather(seq_clip_ratio)
+            self._metrics[mode]["adaptive_is/seq_level_clipped"].append(gathered_seq_clip.nanmean().item())
+
+            # Breakdown of clipping by type
+            # Tokens that would have been clipped at token-level (before switching)
+            would_clip_low = (token_ratios < 1 - self.epsilon_low) & completion_mask.bool()
+            would_clip_high = (token_ratios > 1 + self.epsilon_high) & completion_mask.bool()
+
+            token_would_clip_low_ratio = masked_batch_mean(would_clip_low.float())
+            token_would_clip_high_ratio = masked_batch_mean(would_clip_high.float())
+            gathered_would_low = self.accelerator.gather(token_would_clip_low_ratio)
+            gathered_would_high = self.accelerator.gather(token_would_clip_high_ratio)
+            self._metrics[mode]["adaptive_is/would_token_clip_low"].append(gathered_would_low.nanmean().item())
+            self._metrics[mode]["adaptive_is/would_token_clip_high"].append(gathered_would_high.nanmean().item())
+
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):

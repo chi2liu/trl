@@ -509,11 +509,29 @@ class GRPOConfig(TrainingArguments):
     importance_sampling_level: str = field(
         default="token",
         metadata={
-            "help": "Controls whether importance sampling ratios are computed at the `'token'` or `'sequence'` level. "
-            "`'token'` keeps the raw per-token log-probability ratios (one weight per token).  `'sequence'` averages "
-            "the log-probability ratios across valid tokens to produce a single ratio per sequence. The GSPO paper "
-            "shows that sequence-level sampling often yields more stable training and better alignment with "
-            "sequence-level rewards."
+            "help": "Controls whether importance sampling ratios are computed at the `'token'`, `'sequence'`, or "
+            "`'adaptive'` level. `'token'` keeps the raw per-token log-probability ratios (one weight per token). "
+            "`'sequence'` averages the log-probability ratios across valid tokens to produce a single ratio per "
+            "sequence. `'adaptive'` dynamically switches between token-level and sequence-level based on whether "
+            "tokens would be clipped, using sequence-level for extreme ratios and token-level for normal ones. "
+            "The GSPO paper shows that sequence-level sampling often yields more stable training and better "
+            "alignment with sequence-level rewards."
+        },
+    )
+    sequence_epsilon_low: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Lower-bound epsilon value for sequence-level clipping in adaptive importance sampling. "
+            "If not specified, defaults to the value of `epsilon`. This is used when tokens are switched to "
+            "sequence-level in adaptive mode, typically set to be more lenient than token-level epsilon."
+        },
+    )
+    sequence_epsilon_high: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Upper-bound epsilon value for sequence-level clipping in adaptive importance sampling. "
+            "If not specified, defaults to the value of `epsilon_high` (or `epsilon` if `epsilon_high` is not set). "
+            "This is used when tokens are switched to sequence-level in adaptive mode."
         },
     )
     reward_weights: Optional[list[float]] = field(
