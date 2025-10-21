@@ -615,6 +615,30 @@ class GRPOConfig(TrainingArguments):
             "importance sampling ratio, improving training stability."
         },
     )
+    use_ppl_normalization: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use perplexity (PPL) normalization for rewards. When enabled, rewards are weighted "
+            "by the perplexity of the completion, amplifying rewards for less confident (higher PPL) completions. "
+            "This helps the model focus more on uncertain samples where it has more to learn."
+        },
+    )
+    ppl_normalization_power: float = field(
+        default=1.0,
+        metadata={
+            "help": "Power factor for PPL normalization. The PPL weight is computed as PPL^power. "
+            "Higher values amplify the effect of PPL on reward weighting. Values between 0.5 and 2.0 are typical."
+        },
+    )
+    ppl_normalization_scale: str = field(
+        default="batch",
+        metadata={
+            "help": "Scaling strategy for PPL normalization. Supported values are: "
+            "'batch': normalize PPL values by the batch mean and std, "
+            "'group': normalize PPL values within each generation group, "
+            "'none': use raw PPL values without normalization."
+        },
+    )
 
     # Parameters that control the logging
     log_completions: bool = field(
@@ -627,6 +651,30 @@ class GRPOConfig(TrainingArguments):
     num_completions_to_print: Optional[int] = field(
         default=None,
         metadata={"help": "Number of completions to print with `rich`. If `None`, all completions are logged."},
+    )
+    clipped_token_penalty: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to apply a penalty to clipped tokens instead of ignoring them. When enabled, "
+            "tokens that would be clipped get a reverse gradient update to push the model away from "
+            "extreme probability ratios."
+        },
+    )
+    clipped_token_penalty_weight: float = field(
+        default=0.1,
+        metadata={
+            "help": "Weight for the penalty applied to clipped tokens. Higher values mean stronger penalties. "
+            "Typical values are between 0.01 and 0.5."
+        },
+    )
+    clipped_token_penalty_type: str = field(
+        default="reverse",
+        metadata={
+            "help": "Type of penalty to apply to clipped tokens. Supported values are: "
+            "'reverse': Apply reverse advantage (negative for positive advantage, positive for negative), "
+            "'constant': Apply a constant negative penalty regardless of advantage sign, "
+            "'proportional': Penalty proportional to how far the ratio is from the clip boundary."
+        },
     )
     wandb_log_unique_prompts: Optional[bool] = field(
         default=False,

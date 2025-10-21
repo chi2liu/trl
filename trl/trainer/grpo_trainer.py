@@ -362,6 +362,12 @@ class GRPOTrainer(BaseTrainer):
         self.importance_sampling_level = args.importance_sampling_level
         self.mask_truncated_completions = args.mask_truncated_completions
         self.top_entropy_quantile = args.top_entropy_quantile
+        self.use_ppl_normalization = args.use_ppl_normalization
+        self.ppl_normalization_power = args.ppl_normalization_power
+        self.ppl_normalization_scale = args.ppl_normalization_scale
+        self.clipped_token_penalty = args.clipped_token_penalty
+        self.clipped_token_penalty_weight = args.clipped_token_penalty_weight
+        self.clipped_token_penalty_type = args.clipped_token_penalty_type
         if self.use_liger_loss and self.top_entropy_quantile < 1.0:
             raise NotImplementedError(
                 "Liger Kernels don't currently support masking token positions based on entropy."
@@ -1718,6 +1724,42 @@ class GRPOTrainer(BaseTrainer):
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+        # Apply penalty to clipped tokens if enabled
+        if self.clipped_token_penalty:
+            # Identify clipped tokens
+            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
+            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+            is_clipped = is_low_clipped | is_high_clipped
+
+            # Calculate penalty based on the specified type
+            if self.clipped_token_penalty_type == "reverse":
+                # Apply reverse advantage: penalize in opposite direction
+                # For positive advantages that got clipped high, apply negative penalty
+                # For negative advantages that got clipped low, apply positive penalty
+                penalty = -advantages.unsqueeze(1) * self.clipped_token_penalty_weight
+            elif self.clipped_token_penalty_type == "constant":
+                # Apply constant negative penalty to all clipped tokens
+                penalty = torch.ones_like(advantages.unsqueeze(1)) * self.clipped_token_penalty_weight
+            elif self.clipped_token_penalty_type == "proportional":
+                # Penalty proportional to how far the ratio is from the clip boundary
+                low_distance = torch.relu((1 - self.epsilon_low) - coef_1)
+                high_distance = torch.relu(coef_1 - (1 + self.epsilon_high))
+                distance = low_distance + high_distance
+                penalty = distance * self.clipped_token_penalty_weight
+            else:
+                raise ValueError(f"Unknown clipped_token_penalty_type: {self.clipped_token_penalty_type}")
+
+            # Apply penalty only to clipped tokens
+            clipped_penalty = penalty * is_clipped.float()
+            per_token_loss = per_token_loss + clipped_penalty
+
+            # Log penalty metrics
+            mode = "train" if self.model.training else "eval"
+            penalty_mean = (clipped_penalty * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            self._metrics[mode]["clipped_penalty/mean"].append(self.accelerator.gather(penalty_mean).nanmean().item())
+            self._metrics[mode]["clipped_penalty/count"].append(self.accelerator.gather(is_clipped.float().sum()).mean().item())
+
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
