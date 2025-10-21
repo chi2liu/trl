@@ -640,7 +640,8 @@ class GRPOConfig(TrainingArguments):
         default=0.1,
         metadata={
             "help": "Weight for the penalty applied to clipped tokens. Higher values mean stronger penalties. "
-            "Typical values are between 0.01 and 0.5."
+            "Typical values are between 0.01 and 0.5. Note: This parameter is NOT used when "
+            "clipped_token_penalty_type='gspo_reverse', which directly switches to reverse GSPO mode."
         },
     )
     clipped_token_penalty_type: str = field(
@@ -650,7 +651,7 @@ class GRPOConfig(TrainingArguments):
             "'reverse': Apply reverse advantage (negative for positive advantage, positive for negative), "
             "'constant': Apply a constant negative penalty regardless of advantage sign, "
             "'proportional': Penalty proportional to how far the ratio is from the clip boundary, "
-            "'gspo_reverse': Apply GSPO-style sequence-level penalty in reverse direction for clipped tokens."
+            "'gspo_reverse': Switch clipped tokens to GSPO mode with reverse update (no weight needed)."
         },
     )
     wandb_log_unique_prompts: Optional[bool] = field(
