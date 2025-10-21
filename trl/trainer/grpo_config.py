@@ -644,6 +644,21 @@ class GRPOConfig(TrainingArguments):
             "This provides stronger correction for systematic policy deviations."
         },
     )
+    gspo_epsilon_low: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Lower bound epsilon for GSPO mode clipping. If None, uses the same value as epsilon. "
+            "This controls how much the sequence-level coefficient can decrease (e.g., 0.3 means clip at 0.7)."
+        },
+    )
+    gspo_epsilon_high: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Upper bound epsilon for GSPO mode clipping. If None, uses the same value as epsilon_high. "
+            "This controls how much the sequence-level coefficient can increase (e.g., 0.5 means clip at 1.5). "
+            "Can be set larger than epsilon to allow more flexibility in sequence-level corrections."
+        },
+    )
     wandb_log_unique_prompts: Optional[bool] = field(
         default=False,
         metadata={
@@ -658,6 +673,12 @@ class GRPOConfig(TrainingArguments):
         super().__post_init__()
 
         self.scale_rewards = {True: "group", False: "none"}.get(self.scale_rewards, self.scale_rewards)
+
+        # Set default GSPO epsilon values if not specified
+        if self.gspo_epsilon_low is None:
+            self.gspo_epsilon_low = self.epsilon
+        if self.gspo_epsilon_high is None:
+            self.gspo_epsilon_high = self.epsilon_high if self.epsilon_high is not None else self.epsilon
 
         num_processes = self.world_size
         # The current default effective batch size

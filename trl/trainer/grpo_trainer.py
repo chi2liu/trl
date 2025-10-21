@@ -364,6 +364,8 @@ class GRPOTrainer(BaseTrainer):
         self.top_entropy_quantile = args.top_entropy_quantile
         self.clipped_token_penalty = args.clipped_token_penalty
         self.clipped_token_penalty_gspo = args.clipped_token_penalty_gspo
+        self.gspo_epsilon_low = args.gspo_epsilon_low
+        self.gspo_epsilon_high = args.gspo_epsilon_high
         if self.use_liger_loss and self.top_entropy_quantile < 1.0:
             raise NotImplementedError(
                 "Liger Kernels don't currently support masking token positions based on entropy."
@@ -1736,9 +1738,13 @@ class GRPOTrainer(BaseTrainer):
             # Compute the sequence-level coefficient
             seq_coef = torch.exp(seq_log_importance)
 
+            # Apply GSPO-specific clipping bounds
+            seq_coef_clipped = torch.clamp(seq_coef, 1 - self.gspo_epsilon_low, 1 + self.gspo_epsilon_high)
+
             # For clipped tokens, replace their token-level loss with
             # reverse GSPO loss (negative of what GSPO would do)
-            reverse_gspo_loss = -seq_coef * advantages.unsqueeze(1)
+            # Use the clipped sequence coefficient
+            reverse_gspo_loss = -seq_coef_clipped * advantages.unsqueeze(1)
 
             # Store original loss for comparison
             original_loss = per_token_loss.clone()
@@ -1758,17 +1764,18 @@ class GRPOTrainer(BaseTrainer):
             # (In our implementation, ALL clipped tokens switch to GSPO-reverse)
             gspo_switched_percentage = 100.0 if clipped_tokens > 0 else 0.0
 
-            # 3. Check if GSPO-reverse tokens would still be clipped
-            # After GSPO-reverse, the effective coefficient is seq_coef (for comparison)
-            # Check if seq_coef would also be clipped
-            seq_coef_expanded = seq_coef.expand_as(coef_1)
-            would_be_clipped_low = (seq_coef_expanded < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-            would_be_clipped_high = (seq_coef_expanded > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
-            would_be_clipped = would_be_clipped_low | would_be_clipped_high
+            # 3. Check if GSPO coefficients are clipped by GSPO bounds
+            # We check against GSPO-specific bounds, not the original bounds
+            gspo_clipped_low = (seq_coef < 1 - self.gspo_epsilon_low)
+            gspo_clipped_high = (seq_coef > 1 + self.gspo_epsilon_high)
+            gspo_is_clipped = gspo_clipped_low | gspo_clipped_high
 
-            # Percentage of GSPO tokens that would still be clipped
+            # Expand for token-level comparison
+            gspo_is_clipped_expanded = gspo_is_clipped.expand_as(is_clipped)
+
+            # Percentage of GSPO tokens that are clipped by GSPO bounds
             gspo_tokens = is_clipped.float() * completion_mask
-            gspo_still_clipped = (would_be_clipped.float() * is_clipped.float() * completion_mask).sum()
+            gspo_still_clipped = (gspo_is_clipped_expanded.float() * is_clipped.float() * completion_mask).sum()
             gspo_reclip_percentage = (gspo_still_clipped / gspo_tokens.sum().clamp(min=1.0)) * 100.0 if clipped_tokens > 0 else 0.0
 
             # Log all statistics
@@ -1806,6 +1813,19 @@ class GRPOTrainer(BaseTrainer):
             )
             self._metrics[mode]["gspo_stats/seq_coef_gt_1.2_pct"].append(
                 self.accelerator.gather(seq_coef_gt_12).item()
+            )
+
+            # Log GSPO clipping statistics
+            gspo_low_clip_pct = gspo_clipped_low.float().mean() * 100.0
+            gspo_high_clip_pct = gspo_clipped_high.float().mean() * 100.0
+            self._metrics[mode]["gspo_clip/low_pct"].append(
+                self.accelerator.gather(gspo_low_clip_pct).item()
+            )
+            self._metrics[mode]["gspo_clip/high_pct"].append(
+                self.accelerator.gather(gspo_high_clip_pct).item()
+            )
+            self._metrics[mode]["gspo_clip/total_pct"].append(
+                self.accelerator.gather(gspo_is_clipped.float().mean() * 100.0).item()
             )
 
         if entropy_mask is not None:
