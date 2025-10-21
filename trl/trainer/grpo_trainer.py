@@ -1746,13 +1746,67 @@ class GRPOTrainer(BaseTrainer):
             # Replace loss for clipped tokens with reverse GSPO loss
             per_token_loss = torch.where(is_clipped, reverse_gspo_loss, original_loss)
 
-            # Log metrics
+            # Compute detailed statistics
             mode = "train" if self.model.training else "eval"
-            loss_diff = (reverse_gspo_loss - original_loss) * is_clipped.float()
-            loss_diff_mean = (loss_diff * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-            self._metrics[mode]["gspo_reverse/loss_diff"].append(self.accelerator.gather(loss_diff_mean).nanmean().item())
-            self._metrics[mode]["gspo_reverse/clipped_count"].append(self.accelerator.gather(is_clipped.float().sum()).mean().item())
-            self._metrics[mode]["gspo_reverse/seq_coef_mean"].append(self.accelerator.gather(seq_coef.mean()).item())
+
+            # 1. Percentage of tokens that are clipped (before GSPO)
+            total_tokens = completion_mask.sum()
+            clipped_tokens = (is_clipped.float() * completion_mask).sum()
+            clipped_percentage = (clipped_tokens / total_tokens.clamp(min=1.0)) * 100.0
+
+            # 2. Percentage of clipped tokens that switch to GSPO
+            # (In our implementation, ALL clipped tokens switch to GSPO-reverse)
+            gspo_switched_percentage = 100.0 if clipped_tokens > 0 else 0.0
+
+            # 3. Check if GSPO-reverse tokens would still be clipped
+            # After GSPO-reverse, the effective coefficient is seq_coef (for comparison)
+            # Check if seq_coef would also be clipped
+            seq_coef_expanded = seq_coef.expand_as(coef_1)
+            would_be_clipped_low = (seq_coef_expanded < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
+            would_be_clipped_high = (seq_coef_expanded > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+            would_be_clipped = would_be_clipped_low | would_be_clipped_high
+
+            # Percentage of GSPO tokens that would still be clipped
+            gspo_tokens = is_clipped.float() * completion_mask
+            gspo_still_clipped = (would_be_clipped.float() * is_clipped.float() * completion_mask).sum()
+            gspo_reclip_percentage = (gspo_still_clipped / gspo_tokens.sum().clamp(min=1.0)) * 100.0 if clipped_tokens > 0 else 0.0
+
+            # Log all statistics
+            self._metrics[mode]["clip_stats/tokens_clipped_pct"].append(
+                self.accelerator.gather(clipped_percentage).mean().item()
+            )
+            self._metrics[mode]["clip_stats/tokens_low_clipped_pct"].append(
+                self.accelerator.gather((is_low_clipped.float() * completion_mask).sum() / total_tokens.clamp(min=1.0) * 100.0).mean().item()
+            )
+            self._metrics[mode]["clip_stats/tokens_high_clipped_pct"].append(
+                self.accelerator.gather((is_high_clipped.float() * completion_mask).sum() / total_tokens.clamp(min=1.0) * 100.0).mean().item()
+            )
+            self._metrics[mode]["gspo_stats/switched_pct"].append(gspo_switched_percentage)
+            self._metrics[mode]["gspo_stats/reclipped_pct"].append(
+                self.accelerator.gather(gspo_reclip_percentage).mean().item()
+            )
+            self._metrics[mode]["gspo_stats/seq_coef_mean"].append(
+                self.accelerator.gather(seq_coef.mean()).item()
+            )
+            self._metrics[mode]["gspo_stats/seq_coef_std"].append(
+                self.accelerator.gather(seq_coef.std()).item()
+            )
+
+            # Additional statistics for analysis
+            # Check distribution of seq_coef values
+            seq_coef_lt_08 = (seq_coef < 0.8).float().mean() * 100.0  # Very low confidence
+            seq_coef_08_12 = ((seq_coef >= 0.8) & (seq_coef <= 1.2)).float().mean() * 100.0  # Normal range
+            seq_coef_gt_12 = (seq_coef > 1.2).float().mean() * 100.0  # Very high confidence
+
+            self._metrics[mode]["gspo_stats/seq_coef_lt_0.8_pct"].append(
+                self.accelerator.gather(seq_coef_lt_08).item()
+            )
+            self._metrics[mode]["gspo_stats/seq_coef_0.8_1.2_pct"].append(
+                self.accelerator.gather(seq_coef_08_12).item()
+            )
+            self._metrics[mode]["gspo_stats/seq_coef_gt_1.2_pct"].append(
+                self.accelerator.gather(seq_coef_gt_12).item()
+            )
 
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
