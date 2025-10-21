@@ -1744,6 +1744,42 @@ class GRPOTrainer(BaseTrainer):
                 high_distance = torch.relu(coef_1 - (1 + self.epsilon_high))
                 distance = low_distance + high_distance
                 penalty = distance * self.clipped_token_penalty_weight
+            elif self.clipped_token_penalty_type == "gspo_reverse":
+                # GSPO-style sequence-level penalty in reverse direction
+                # For clipped tokens, compute sequence-level importance weights
+                # but apply them in reverse (negative direction)
+
+                # First, identify sequences that have any clipped tokens
+                # is_clipped shape: (batch_size, seq_len)
+                has_clipped = is_clipped.any(dim=-1, keepdim=True)  # (batch_size, 1)
+
+                # Compute sequence-level log importance weights for sequences with clipped tokens
+                # This aggregates the log ratios across the sequence
+                seq_log_ratio = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+                seq_log_importance = seq_log_ratio.unsqueeze(-1)  # (batch_size, 1)
+
+                # Compute the sequence-level coefficient (like GSPO does)
+                seq_coef = torch.exp(seq_log_importance)
+
+                # For sequences with clipped tokens, apply reverse GSPO penalty
+                # The idea: if a sequence has extreme deviations (clipped tokens),
+                # we apply a sequence-level correction in the opposite direction
+                # This is stronger than token-level because it considers the whole sequence context
+
+                # Compute how far the sequence-level ratio deviates from 1.0
+                seq_deviation = (seq_coef - 1.0)
+
+                # Apply reverse penalty: push the sequence in opposite direction
+                # If seq_coef > 1 (model too confident), apply negative penalty
+                # If seq_coef < 1 (model too uncertain), apply positive penalty
+                penalty = -seq_deviation * advantages.unsqueeze(1) * self.clipped_token_penalty_weight
+
+                # Only apply to sequences that have clipped tokens
+                penalty = penalty * has_clipped.float()
+
+                # Additionally, mask the penalty to only affect clipped tokens within those sequences
+                # This creates a hybrid: sequence-level penalty strength, token-level application
+                penalty = penalty * is_clipped.float()
             else:
                 raise ValueError(f"Unknown clipped_token_penalty_type: {self.clipped_token_penalty_type}")
 

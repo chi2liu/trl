@@ -649,7 +649,8 @@ class GRPOConfig(TrainingArguments):
             "help": "Type of penalty to apply to clipped tokens. Supported values are: "
             "'reverse': Apply reverse advantage (negative for positive advantage, positive for negative), "
             "'constant': Apply a constant negative penalty regardless of advantage sign, "
-            "'proportional': Penalty proportional to how far the ratio is from the clip boundary."
+            "'proportional': Penalty proportional to how far the ratio is from the clip boundary, "
+            "'gspo_reverse': Apply GSPO-style sequence-level penalty in reverse direction for clipped tokens."
         },
     )
     wandb_log_unique_prompts: Optional[bool] = field(
