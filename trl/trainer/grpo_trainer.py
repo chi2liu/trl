@@ -363,8 +363,7 @@ class GRPOTrainer(BaseTrainer):
         self.mask_truncated_completions = args.mask_truncated_completions
         self.top_entropy_quantile = args.top_entropy_quantile
         self.clipped_token_penalty = args.clipped_token_penalty
-        self.clipped_token_penalty_weight = args.clipped_token_penalty_weight
-        self.clipped_token_penalty_type = args.clipped_token_penalty_type
+        self.clipped_token_penalty_gspo = args.clipped_token_penalty_gspo
         if self.use_liger_loss and self.top_entropy_quantile < 1.0:
             raise NotImplementedError(
                 "Liger Kernels don't currently support masking token positions based on entropy."
@@ -1722,78 +1721,38 @@ class GRPOTrainer(BaseTrainer):
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
-        # Apply penalty to clipped tokens if enabled
-        if self.clipped_token_penalty:
+        # Apply GSPO-reverse for clipped tokens if enabled
+        if self.clipped_token_penalty and self.clipped_token_penalty_gspo:
             # Identify clipped tokens
             is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
             is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
             is_clipped = is_low_clipped | is_high_clipped
 
-            # Calculate penalty based on the specified type
-            if self.clipped_token_penalty_type == "reverse":
-                # Apply reverse advantage: penalize in opposite direction
-                # For positive advantages that got clipped high, apply negative penalty
-                # For negative advantages that got clipped low, apply positive penalty
-                penalty = -advantages.unsqueeze(1) * self.clipped_token_penalty_weight
-            elif self.clipped_token_penalty_type == "constant":
-                # Apply constant negative penalty to all clipped tokens
-                penalty = torch.ones_like(advantages.unsqueeze(1)) * self.clipped_token_penalty_weight
-            elif self.clipped_token_penalty_type == "proportional":
-                # Penalty proportional to how far the ratio is from the clip boundary
-                low_distance = torch.relu((1 - self.epsilon_low) - coef_1)
-                high_distance = torch.relu(coef_1 - (1 + self.epsilon_high))
-                distance = low_distance + high_distance
-                penalty = distance * self.clipped_token_penalty_weight
-            elif self.clipped_token_penalty_type == "gspo_reverse":
-                # Direct GSPO-style update in reverse direction for clipped tokens
-                # No weight needed - just switch clipped tokens to use sequence-level
-                # importance sampling but apply it in reverse
+            # Direct GSPO-style update in reverse direction for clipped tokens
+            # Compute sequence-level log importance weights (GSPO style)
+            seq_log_ratio = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            seq_log_importance = seq_log_ratio.unsqueeze(-1)
 
-                # Compute sequence-level log importance weights (GSPO style)
-                seq_log_ratio = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-                seq_log_importance = seq_log_ratio.unsqueeze(-1)  # (batch_size, 1)
+            # Compute the sequence-level coefficient
+            seq_coef = torch.exp(seq_log_importance)
 
-                # Compute the sequence-level coefficient
-                seq_coef = torch.exp(seq_log_importance)
+            # For clipped tokens, replace their token-level loss with
+            # reverse GSPO loss (negative of what GSPO would do)
+            reverse_gspo_loss = -seq_coef * advantages.unsqueeze(1)
 
-                # For clipped tokens, replace their token-level loss with
-                # reverse GSPO loss (negative of what GSPO would do)
-                # This is equivalent to: -seq_coef * advantages instead of +seq_coef * advantages
+            # Store original loss for comparison
+            original_loss = per_token_loss.clone()
 
-                # Create the reverse GSPO loss for all tokens
-                reverse_gspo_loss = -seq_coef * advantages.unsqueeze(1)
+            # Replace loss for clipped tokens with reverse GSPO loss
+            per_token_loss = torch.where(is_clipped, reverse_gspo_loss, original_loss)
 
-                # Now we need to replace the loss for clipped tokens:
-                # For clipped tokens: use reverse_gspo_loss
-                # For non-clipped tokens: keep original per_token_loss
-                # This is a direct switch, not an addition
-
-                # Store original loss for non-clipped tokens
-                original_loss = per_token_loss.clone()
-
-                # Replace loss for clipped tokens with reverse GSPO loss
-                per_token_loss = torch.where(is_clipped, reverse_gspo_loss, original_loss)
-
-                # Note: We're completely replacing the loss calculation for clipped tokens
-                # They now use sequence-level importance but in reverse direction
-                # This is cleaner than adding a penalty - it's a direct mode switch
-            else:
-                raise ValueError(f"Unknown clipped_token_penalty_type: {self.clipped_token_penalty_type}")
-
-            # Apply penalty for non-GSPO types (GSPO-reverse already modified per_token_loss directly)
-            if self.clipped_token_penalty_type != "gspo_reverse":
-                clipped_penalty = penalty * is_clipped.float()
-                per_token_loss = per_token_loss + clipped_penalty
-            else:
-                # For gspo_reverse, we already replaced the loss directly
-                # Just compute the penalty metric for logging
-                clipped_penalty = (reverse_gspo_loss - original_loss) * is_clipped.float()
-
-            # Log penalty metrics
+            # Log metrics
             mode = "train" if self.model.training else "eval"
-            penalty_mean = (clipped_penalty * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-            self._metrics[mode]["clipped_penalty/mean"].append(self.accelerator.gather(penalty_mean).nanmean().item())
-            self._metrics[mode]["clipped_penalty/count"].append(self.accelerator.gather(is_clipped.float().sum()).mean().item())
+            loss_diff = (reverse_gspo_loss - original_loss) * is_clipped.float()
+            loss_diff_mean = (loss_diff * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            self._metrics[mode]["gspo_reverse/loss_diff"].append(self.accelerator.gather(loss_diff_mean).nanmean().item())
+            self._metrics[mode]["gspo_reverse/clipped_count"].append(self.accelerator.gather(is_clipped.float().sum()).mean().item())
+            self._metrics[mode]["gspo_reverse/seq_coef_mean"].append(self.accelerator.gather(seq_coef.mean()).item())
 
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
