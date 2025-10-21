@@ -362,9 +362,6 @@ class GRPOTrainer(BaseTrainer):
         self.importance_sampling_level = args.importance_sampling_level
         self.mask_truncated_completions = args.mask_truncated_completions
         self.top_entropy_quantile = args.top_entropy_quantile
-        self.use_ppl_normalization = args.use_ppl_normalization
-        self.ppl_normalization_power = args.ppl_normalization_power
-        self.ppl_normalization_scale = args.ppl_normalization_scale
         self.clipped_token_penalty = args.clipped_token_penalty
         self.clipped_token_penalty_weight = args.clipped_token_penalty_weight
         self.clipped_token_penalty_type = args.clipped_token_penalty_type
