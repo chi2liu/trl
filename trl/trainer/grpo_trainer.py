@@ -366,6 +366,9 @@ class GRPOTrainer(BaseTrainer):
         self.clipped_token_penalty_gspo = args.clipped_token_penalty_gspo
         self.gspo_epsilon_low = args.gspo_epsilon_low
         self.gspo_epsilon_high = args.gspo_epsilon_high
+        self.gspo_to_grpo_fallback = args.gspo_to_grpo_fallback
+        self.gspo_fallback_epsilon = args.gspo_fallback_epsilon
+        self.gspo_fallback_epsilon_high = args.gspo_fallback_epsilon_high
         if self.use_liger_loss and self.top_entropy_quantile < 1.0:
             raise NotImplementedError(
                 "Liger Kernels don't currently support masking token positions based on entropy."
@@ -1699,29 +1702,401 @@ class GRPOTrainer(BaseTrainer):
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
 
         log_ratio = per_token_logps - old_per_token_logps
-        if self.importance_sampling_level == "token":
-            log_importance_weights = log_ratio
-        elif self.importance_sampling_level == "sequence":
-            log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-            log_importance_weights = log_importance_weights.unsqueeze(-1)
-        else:
-            raise ValueError(
-                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
-                "and 'sequence'."
+
+        # GSPO-to-GRPO Fallback Mode: Start with sequence-level, fallback to token-level for clipped sequences
+        if self.gspo_to_grpo_fallback and self.importance_sampling_level == "sequence":
+            # Step 1: Compute sequence-level coefficients (GSPO default)
+            seq_log_ratio = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            seq_log_importance = seq_log_ratio.unsqueeze(-1)
+            seq_coef = torch.exp(seq_log_importance)
+
+            # Apply GSPO clipping
+            seq_coef_clipped = torch.clamp(seq_coef, 1 - self.gspo_epsilon_low, 1 + self.gspo_epsilon_high)
+
+            # Compute GSPO loss
+            gspo_loss1 = seq_coef * advantages.unsqueeze(1)
+            gspo_loss2 = seq_coef_clipped * advantages.unsqueeze(1)
+            per_token_loss_gspo = -torch.min(gspo_loss1, gspo_loss2)
+
+            # Step 2: Identify sequences clipped at GSPO level
+            gspo_low_clipped = (seq_coef < 1 - self.gspo_epsilon_low) & (advantages < 0)
+            gspo_high_clipped = (seq_coef > 1 + self.gspo_epsilon_high) & (advantages > 0)
+            gspo_is_clipped = (gspo_low_clipped | gspo_high_clipped).unsqueeze(-1)  # Shape: (B, 1)
+
+            # Step 3: For clipped sequences, compute token-level GRPO loss
+            token_coef = torch.exp(log_ratio)  # Token-level coefficients
+
+            # Apply potentially tighter bounds for fallback
+            fallback_epsilon_low = 1 - self.gspo_fallback_epsilon
+            fallback_epsilon_high = 1 + self.gspo_fallback_epsilon_high
+            token_coef_clipped = torch.clamp(token_coef, fallback_epsilon_low, fallback_epsilon_high)
+
+            # Compute token-level GRPO loss
+            grpo_loss1 = token_coef * advantages.unsqueeze(1)
+            grpo_loss2 = token_coef_clipped * advantages.unsqueeze(1)
+            per_token_loss_grpo = -torch.min(grpo_loss1, grpo_loss2)
+
+            # Step 4: Combine losses - use GRPO for clipped sequences, GSPO for others
+            gspo_is_clipped_expanded = gspo_is_clipped.expand_as(per_token_loss_grpo)
+            per_token_loss = torch.where(gspo_is_clipped_expanded, per_token_loss_grpo, per_token_loss_gspo)
+
+            # Statistics tracking for GSPO-to-GRPO fallback
+            mode = "train" if self.model.training else "eval"
+
+            # Compute PPL for GSPO mode (sequence-level)
+            # avg_log_p = (1/T) * sum(log p(x_t))
+            avg_log_p_new = (per_token_logps * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            avg_log_p_old = (old_per_token_logps * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+
+            # PPL = exp(-avg_log_p)
+            ppl_new = torch.exp(-avg_log_p_new)
+            ppl_old = torch.exp(-avg_log_p_old)
+            ppl_ratio = ppl_old / ppl_new  # Should equal seq_coef.squeeze(-1)
+
+            # Log PPL statistics
+            self._metrics[mode]["ppl/new_policy_mean"].append(
+                self.accelerator.gather(ppl_new.mean()).mean().item()
             )
-        # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
-        # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
+            self._metrics[mode]["ppl/old_policy_mean"].append(
+                self.accelerator.gather(ppl_old.mean()).mean().item()
+            )
+            self._metrics[mode]["ppl/ratio_mean"].append(
+                self.accelerator.gather(ppl_ratio.mean()).mean().item()
+            )
+            self._metrics[mode]["ppl/ratio_std"].append(
+                self.accelerator.gather(ppl_ratio.std()).mean().item()
+            )
+            self._metrics[mode]["ppl/avg_log_p_new"].append(
+                self.accelerator.gather(avg_log_p_new.mean()).mean().item()
+            )
+            self._metrics[mode]["ppl/avg_log_p_old"].append(
+                self.accelerator.gather(avg_log_p_old.mean()).mean().item()
+            )
 
-        coef_1 = torch.exp(log_importance_weights)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            # ============================================================
+            # THEORETICAL CORE METRICS (GSPO-to-GRPO Fallback Mode)
+            # ============================================================
+            # s(θ): sequence-level importance ratio
+            s_theta = seq_coef.squeeze(-1)  # (B,)
 
-        # Two-sided clipping
-        if self.args.delta is not None:
-            coef_1 = torch.clamp(coef_1, max=self.args.delta)
+            # Cross-entropies: H = -avg_log_p
+            H_new = -avg_log_p_new  # Cross-entropy under new policy
+            H_old = -avg_log_p_old  # Cross-entropy under old policy
+            delta_H = H_old - H_new  # Entropy difference
+            exp_delta_H = torch.exp(delta_H)  # exp(ΔH)
 
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+            self._metrics[mode]["theory/s_theta_mean"].append(
+                self.accelerator.gather(s_theta.mean()).mean().item()
+            )
+            self._metrics[mode]["theory/s_theta_std"].append(
+                self.accelerator.gather(s_theta.std()).mean().item()
+            )
+            self._metrics[mode]["theory/H_new_mean"].append(
+                self.accelerator.gather(H_new.mean()).mean().item()
+            )
+            self._metrics[mode]["theory/H_old_mean"].append(
+                self.accelerator.gather(H_old.mean()).mean().item()
+            )
+            self._metrics[mode]["theory/delta_H_mean"].append(
+                self.accelerator.gather(delta_H.mean()).mean().item()
+            )
+            self._metrics[mode]["theory/delta_H_std"].append(
+                self.accelerator.gather(delta_H.std()).mean().item()
+            )
+            self._metrics[mode]["theory/exp_delta_H_mean"].append(
+                self.accelerator.gather(exp_delta_H.mean()).mean().item()
+            )
+
+            # ============================================================
+            # VERIFICATION METRICS (GSPO-to-GRPO Fallback Mode)
+            # ============================================================
+            # |s(θ) - PPL_ratio|: equivalence error
+            equiv_error = torch.abs(s_theta - ppl_ratio)
+            self._metrics[mode]["verify/s_theta_ppl_ratio_error_mean"].append(
+                self.accelerator.gather(equiv_error.mean()).mean().item()
+            )
+            self._metrics[mode]["verify/s_theta_ppl_ratio_error_max"].append(
+                self.accelerator.gather(equiv_error.max()).max().item()
+            )
+
+            # |s(θ) - exp(ΔH)|: exponential equivalence error
+            exp_equiv_error = torch.abs(s_theta - exp_delta_H)
+            self._metrics[mode]["verify/s_theta_exp_delta_H_error_mean"].append(
+                self.accelerator.gather(exp_equiv_error.mean()).mean().item()
+            )
+            self._metrics[mode]["verify/s_theta_exp_delta_H_error_max"].append(
+                self.accelerator.gather(exp_equiv_error.max()).max().item()
+            )
+
+            # Variance reduction factor: var(log(s)) / var(log(w_t))
+            log_s = seq_log_ratio  # (B,) - already computed above
+            log_w_t = log_ratio  # (B, T)
+            # Compute variance of log(s) across batch
+            var_log_s = torch.var(log_s)
+            # Compute variance of log(w_t) across all tokens
+            valid_log_w_t = log_w_t[completion_mask.bool()]
+            var_log_w_t = torch.var(valid_log_w_t) if valid_log_w_t.numel() > 0 else torch.tensor(1.0, device=log_s.device)
+            variance_reduction_factor = var_log_s / var_log_w_t.clamp(min=1e-8)
+
+            self._metrics[mode]["verify/var_log_s"].append(
+                self.accelerator.gather(var_log_s).mean().item()
+            )
+            self._metrics[mode]["verify/var_log_w_t"].append(
+                self.accelerator.gather(var_log_w_t).mean().item()
+            )
+            self._metrics[mode]["verify/variance_reduction_factor"].append(
+                self.accelerator.gather(variance_reduction_factor).mean().item()
+            )
+
+            # ============================================================
+            # PRACTICAL METRICS (GSPO-to-GRPO Fallback Mode)
+            # ============================================================
+            # Clipping frequency at GSPO level: % sequences clipped
+            clipping_frequency = gspo_is_clipped[:, 0].float().mean() * 100.0  # percentage
+            self._metrics[mode]["practice/clipping_frequency_pct"].append(
+                self.accelerator.gather(clipping_frequency).mean().item()
+            )
+            self._metrics[mode]["practice/low_clipping_frequency_pct"].append(
+                self.accelerator.gather(gspo_low_clipped.float().mean() * 100.0).mean().item()
+            )
+            self._metrics[mode]["practice/high_clipping_frequency_pct"].append(
+                self.accelerator.gather(gspo_high_clipped.float().mean() * 100.0).mean().item()
+            )
+
+            # Entropy bound: max|ΔH| vs log(1+ε)
+            abs_delta_H = torch.abs(delta_H)
+            max_abs_delta_H = abs_delta_H.max()
+            epsilon_bound = torch.log(torch.tensor(1.0 + self.gspo_epsilon_high, device=delta_H.device))
+
+            self._metrics[mode]["practice/max_abs_delta_H"].append(
+                self.accelerator.gather(max_abs_delta_H).max().item()
+            )
+            self._metrics[mode]["practice/epsilon_bound_log_1_plus_eps"].append(
+                epsilon_bound.item()  # constant, no need to gather
+            )
+            # Check if entropy bound is violated
+            entropy_bound_violated = (max_abs_delta_H > epsilon_bound).float()
+            self._metrics[mode]["practice/entropy_bound_violation_rate"].append(
+                self.accelerator.gather(entropy_bound_violated).mean().item()
+            )
+
+            # Total sequences
+            batch_size = seq_coef.shape[0]
+
+            # Sequences using GSPO (not clipped)
+            gspo_seqs = (~gspo_is_clipped[:, 0]).sum()
+            gspo_seq_pct = (gspo_seqs.float() / batch_size) * 100.0
+
+            # Sequences falling back to GRPO (clipped at GSPO level)
+            grpo_fallback_seqs = gspo_is_clipped[:, 0].sum()
+            grpo_fallback_pct = (grpo_fallback_seqs.float() / batch_size) * 100.0
+
+            # For sequences using GRPO, how many tokens are clipped?
+            if grpo_fallback_seqs > 0:
+                # Check token-level clipping in fallback sequences
+                fallback_mask = gspo_is_clipped_expanded & completion_mask
+                token_is_clipped = ((token_coef < fallback_epsilon_low) |
+                                    (token_coef > fallback_epsilon_high))
+                fallback_tokens_clipped = (token_is_clipped & fallback_mask).sum()
+                fallback_total_tokens = fallback_mask.sum()
+                fallback_clip_rate = (fallback_tokens_clipped.float() /
+                                       fallback_total_tokens.clamp(min=1.0)) * 100.0
+            else:
+                fallback_clip_rate = torch.tensor(0.0, device=seq_coef.device)
+
+            # Log statistics
+            self._metrics[mode]["gspo_fallback/gspo_seq_pct"].append(
+                self.accelerator.gather(gspo_seq_pct).mean().item()
+            )
+            self._metrics[mode]["gspo_fallback/grpo_fallback_pct"].append(
+                self.accelerator.gather(grpo_fallback_pct).mean().item()
+            )
+            self._metrics[mode]["gspo_fallback/fallback_token_clip_rate"].append(
+                self.accelerator.gather(fallback_clip_rate).mean().item()
+            )
+
+        else:
+            # Original implementation
+            if self.importance_sampling_level == "token":
+                log_importance_weights = log_ratio
+            elif self.importance_sampling_level == "sequence":
+                log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+                log_importance_weights = log_importance_weights.unsqueeze(-1)
+
+                # Compute PPL for logging in sequence-level mode
+                # PPL_old(x) / PPL_new(x) = exp(avg_log_ratio)
+                # where avg_log_ratio = (1/T) * sum(log p_new - log p_old)
+                mode = "train" if self.model.training else "eval"
+
+                # Compute average log probabilities for each sequence
+                # avg_log_p_new = (1/T) * sum(log p_new(x_t))
+                avg_log_p_new = (per_token_logps * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+                # avg_log_p_old = (1/T) * sum(log p_old(x_t))
+                avg_log_p_old = (old_per_token_logps * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+
+                # PPL = exp(-avg_log_p)
+                ppl_new = torch.exp(-avg_log_p_new)  # PPL under new policy
+                ppl_old = torch.exp(-avg_log_p_old)  # PPL under old policy
+                ppl_ratio = ppl_old / ppl_new  # Should equal exp(log_importance_weights.squeeze(-1))
+
+                # Log PPL statistics
+                self._metrics[mode]["ppl/new_policy_mean"].append(
+                    self.accelerator.gather(ppl_new.mean()).mean().item()
+                )
+                self._metrics[mode]["ppl/old_policy_mean"].append(
+                    self.accelerator.gather(ppl_old.mean()).mean().item()
+                )
+                self._metrics[mode]["ppl/ratio_mean"].append(
+                    self.accelerator.gather(ppl_ratio.mean()).mean().item()
+                )
+                self._metrics[mode]["ppl/ratio_std"].append(
+                    self.accelerator.gather(ppl_ratio.std()).mean().item()
+                )
+
+                # Log the relationship: ppl_ratio should equal seq_coef
+                # This is a sanity check: exp(avg_log_ratio) = PPL_old / PPL_new
+                self._metrics[mode]["ppl/avg_log_p_new"].append(
+                    self.accelerator.gather(avg_log_p_new.mean()).mean().item()
+                )
+                self._metrics[mode]["ppl/avg_log_p_old"].append(
+                    self.accelerator.gather(avg_log_p_old.mean()).mean().item()
+                )
+
+                # ============================================================
+                # THEORETICAL CORE METRICS
+                # ============================================================
+                # s(θ): sequence-level importance ratio
+                s_theta = torch.exp(log_importance_weights.squeeze(-1))  # (B,)
+
+                # Cross-entropies: H = -avg_log_p
+                H_new = -avg_log_p_new  # Cross-entropy under new policy
+                H_old = -avg_log_p_old  # Cross-entropy under old policy
+                delta_H = H_old - H_new  # Entropy difference
+                exp_delta_H = torch.exp(delta_H)  # exp(ΔH)
+
+                self._metrics[mode]["theory/s_theta_mean"].append(
+                    self.accelerator.gather(s_theta.mean()).mean().item()
+                )
+                self._metrics[mode]["theory/s_theta_std"].append(
+                    self.accelerator.gather(s_theta.std()).mean().item()
+                )
+                self._metrics[mode]["theory/H_new_mean"].append(
+                    self.accelerator.gather(H_new.mean()).mean().item()
+                )
+                self._metrics[mode]["theory/H_old_mean"].append(
+                    self.accelerator.gather(H_old.mean()).mean().item()
+                )
+                self._metrics[mode]["theory/delta_H_mean"].append(
+                    self.accelerator.gather(delta_H.mean()).mean().item()
+                )
+                self._metrics[mode]["theory/delta_H_std"].append(
+                    self.accelerator.gather(delta_H.std()).mean().item()
+                )
+                self._metrics[mode]["theory/exp_delta_H_mean"].append(
+                    self.accelerator.gather(exp_delta_H.mean()).mean().item()
+                )
+
+                # ============================================================
+                # VERIFICATION METRICS
+                # ============================================================
+                # |s(θ) - PPL_ratio|: equivalence error
+                equiv_error = torch.abs(s_theta - ppl_ratio)
+                self._metrics[mode]["verify/s_theta_ppl_ratio_error_mean"].append(
+                    self.accelerator.gather(equiv_error.mean()).mean().item()
+                )
+                self._metrics[mode]["verify/s_theta_ppl_ratio_error_max"].append(
+                    self.accelerator.gather(equiv_error.max()).max().item()
+                )
+
+                # |s(θ) - exp(ΔH)|: exponential equivalence error
+                exp_equiv_error = torch.abs(s_theta - exp_delta_H)
+                self._metrics[mode]["verify/s_theta_exp_delta_H_error_mean"].append(
+                    self.accelerator.gather(exp_equiv_error.mean()).mean().item()
+                )
+                self._metrics[mode]["verify/s_theta_exp_delta_H_error_max"].append(
+                    self.accelerator.gather(exp_equiv_error.max()).max().item()
+                )
+
+                # Variance reduction factor: var(log(s)) / var(log(w_t))
+                # log(s) is the sequence-level log ratio (already computed)
+                log_s = log_importance_weights.squeeze(-1)  # (B,)
+                # log(w_t) is the token-level log ratio
+                log_w_t = log_ratio  # (B, T)
+                # Compute variance of log(s) across batch
+                var_log_s = torch.var(log_s)
+                # Compute variance of log(w_t) across all tokens
+                valid_log_w_t = log_w_t[completion_mask.bool()]
+                var_log_w_t = torch.var(valid_log_w_t) if valid_log_w_t.numel() > 0 else torch.tensor(1.0, device=log_s.device)
+                variance_reduction_factor = var_log_s / var_log_w_t.clamp(min=1e-8)
+
+                self._metrics[mode]["verify/var_log_s"].append(
+                    self.accelerator.gather(var_log_s).mean().item()
+                )
+                self._metrics[mode]["verify/var_log_w_t"].append(
+                    self.accelerator.gather(var_log_w_t).mean().item()
+                )
+                self._metrics[mode]["verify/variance_reduction_factor"].append(
+                    self.accelerator.gather(variance_reduction_factor).mean().item()
+                )
+            else:
+                raise ValueError(
+                    f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
+                    "and 'sequence'."
+                )
+            # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
+            # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
+
+            coef_1 = torch.exp(log_importance_weights)
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+
+            # Two-sided clipping
+            if self.args.delta is not None:
+                coef_1 = torch.clamp(coef_1, max=self.args.delta)
+
+            per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+            per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+            # ============================================================
+            # PRACTICAL METRICS (for sequence-level mode)
+            # ============================================================
+            if self.importance_sampling_level == "sequence":
+                mode = "train" if self.model.training else "eval"
+
+                # Clipping frequency: % sequences clipped
+                is_seq_low_clipped = (coef_1.squeeze(-1) < 1 - self.epsilon_low) & (advantages < 0)
+                is_seq_high_clipped = (coef_1.squeeze(-1) > 1 + self.epsilon_high) & (advantages > 0)
+                is_seq_clipped = is_seq_low_clipped | is_seq_high_clipped
+
+                clipping_frequency = is_seq_clipped.float().mean() * 100.0  # percentage
+                self._metrics[mode]["practice/clipping_frequency_pct"].append(
+                    self.accelerator.gather(clipping_frequency).mean().item()
+                )
+                self._metrics[mode]["practice/low_clipping_frequency_pct"].append(
+                    self.accelerator.gather(is_seq_low_clipped.float().mean() * 100.0).mean().item()
+                )
+                self._metrics[mode]["practice/high_clipping_frequency_pct"].append(
+                    self.accelerator.gather(is_seq_high_clipped.float().mean() * 100.0).mean().item()
+                )
+
+                # Entropy bound: max|ΔH| vs log(1+ε)
+                # We already have delta_H computed above (only in sequence mode)
+                if "delta_H" in locals():
+                    abs_delta_H = torch.abs(delta_H)
+                    max_abs_delta_H = abs_delta_H.max()
+                    epsilon_bound = torch.log(torch.tensor(1.0 + self.epsilon_high, device=delta_H.device))
+
+                    self._metrics[mode]["practice/max_abs_delta_H"].append(
+                        self.accelerator.gather(max_abs_delta_H).max().item()
+                    )
+                    self._metrics[mode]["practice/epsilon_bound_log_1_plus_eps"].append(
+                        epsilon_bound.item()  # constant, no need to gather
+                    )
+                    # Check if entropy bound is violated
+                    entropy_bound_violated = (max_abs_delta_H > epsilon_bound).float()
+                    self._metrics[mode]["practice/entropy_bound_violation_rate"].append(
+                        self.accelerator.gather(entropy_bound_violated).mean().item()
+                    )
 
         # Apply GSPO-reverse for clipped tokens if enabled
         if self.clipped_token_penalty and self.clipped_token_penalty_gspo:
@@ -1762,7 +2137,11 @@ class GRPOTrainer(BaseTrainer):
 
             # 2. Percentage of clipped tokens that switch to GSPO
             # (In our implementation, ALL clipped tokens switch to GSPO-reverse)
-            gspo_switched_percentage = 100.0 if clipped_tokens > 0 else 0.0
+            gspo_switched_percentage = torch.where(
+                clipped_tokens > 0,
+                torch.tensor(100.0, device=clipped_tokens.device),
+                torch.tensor(0.0, device=clipped_tokens.device)
+            )
 
             # 3. Check if GSPO coefficients are clipped by GSPO bounds
             # We check against GSPO-specific bounds, not the original bounds
@@ -1776,7 +2155,12 @@ class GRPOTrainer(BaseTrainer):
             # Percentage of GSPO tokens that are clipped by GSPO bounds
             gspo_tokens = is_clipped.float() * completion_mask
             gspo_still_clipped = (gspo_is_clipped_expanded.float() * is_clipped.float() * completion_mask).sum()
-            gspo_reclip_percentage = (gspo_still_clipped / gspo_tokens.sum().clamp(min=1.0)) * 100.0 if clipped_tokens > 0 else 0.0
+            # Always keep as tensor for gathering
+            gspo_reclip_percentage = torch.where(
+                clipped_tokens > 0,
+                (gspo_still_clipped / gspo_tokens.sum().clamp(min=1.0)) * 100.0,
+                torch.tensor(0.0, device=clipped_tokens.device)
+            )
 
             # Log all statistics
             self._metrics[mode]["clip_stats/tokens_clipped_pct"].append(
@@ -1788,15 +2172,17 @@ class GRPOTrainer(BaseTrainer):
             self._metrics[mode]["clip_stats/tokens_high_clipped_pct"].append(
                 self.accelerator.gather((is_high_clipped.float() * completion_mask).sum() / total_tokens.clamp(min=1.0) * 100.0).mean().item()
             )
-            self._metrics[mode]["gspo_stats/switched_pct"].append(gspo_switched_percentage)
+            self._metrics[mode]["gspo_stats/switched_pct"].append(
+                self.accelerator.gather(gspo_switched_percentage).mean().item()
+            )
             self._metrics[mode]["gspo_stats/reclipped_pct"].append(
                 self.accelerator.gather(gspo_reclip_percentage).mean().item()
             )
             self._metrics[mode]["gspo_stats/seq_coef_mean"].append(
-                self.accelerator.gather(seq_coef.mean()).item()
+                self.accelerator.gather(seq_coef.mean()).mean().item()
             )
             self._metrics[mode]["gspo_stats/seq_coef_std"].append(
-                self.accelerator.gather(seq_coef.std()).item()
+                self.accelerator.gather(seq_coef.std()).mean().item()
             )
 
             # Additional statistics for analysis
@@ -1806,26 +2192,26 @@ class GRPOTrainer(BaseTrainer):
             seq_coef_gt_12 = (seq_coef > 1.2).float().mean() * 100.0  # Very high confidence
 
             self._metrics[mode]["gspo_stats/seq_coef_lt_0.8_pct"].append(
-                self.accelerator.gather(seq_coef_lt_08).item()
+                self.accelerator.gather(seq_coef_lt_08).mean().item()
             )
             self._metrics[mode]["gspo_stats/seq_coef_0.8_1.2_pct"].append(
-                self.accelerator.gather(seq_coef_08_12).item()
+                self.accelerator.gather(seq_coef_08_12).mean().item()
             )
             self._metrics[mode]["gspo_stats/seq_coef_gt_1.2_pct"].append(
-                self.accelerator.gather(seq_coef_gt_12).item()
+                self.accelerator.gather(seq_coef_gt_12).mean().item()
             )
 
             # Log GSPO clipping statistics
             gspo_low_clip_pct = gspo_clipped_low.float().mean() * 100.0
             gspo_high_clip_pct = gspo_clipped_high.float().mean() * 100.0
             self._metrics[mode]["gspo_clip/low_pct"].append(
-                self.accelerator.gather(gspo_low_clip_pct).item()
+                self.accelerator.gather(gspo_low_clip_pct).mean().item()
             )
             self._metrics[mode]["gspo_clip/high_pct"].append(
-                self.accelerator.gather(gspo_high_clip_pct).item()
+                self.accelerator.gather(gspo_high_clip_pct).mean().item()
             )
             self._metrics[mode]["gspo_clip/total_pct"].append(
-                self.accelerator.gather(gspo_is_clipped.float().mean() * 100.0).item()
+                self.accelerator.gather(gspo_is_clipped.float().mean() * 100.0).mean().item()
             )
 
         if entropy_mask is not None:

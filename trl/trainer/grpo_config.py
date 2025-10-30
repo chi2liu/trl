@@ -659,6 +659,29 @@ class GRPOConfig(TrainingArguments):
             "Can be set larger than epsilon to allow more flexibility in sequence-level corrections."
         },
     )
+
+    # GSPO-to-GRPO fallback parameters
+    gspo_to_grpo_fallback: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable GSPO-to-GRPO fallback mode. When enabled, sequences clipped at GSPO level "
+            "will fallback to token-level GRPO updates instead of being discarded."
+        },
+    )
+    gspo_fallback_epsilon: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Epsilon for token-level clipping when sequences fallback from GSPO to GRPO. "
+            "If None, uses the main epsilon value. Can be set tighter than main epsilon."
+        },
+    )
+    gspo_fallback_epsilon_high: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Upper bound epsilon for token-level clipping in GRPO fallback mode. "
+            "If None, uses gspo_fallback_epsilon or epsilon_high."
+        },
+    )
     wandb_log_unique_prompts: Optional[bool] = field(
         default=False,
         metadata={
@@ -679,6 +702,12 @@ class GRPOConfig(TrainingArguments):
             self.gspo_epsilon_low = self.epsilon
         if self.gspo_epsilon_high is None:
             self.gspo_epsilon_high = self.epsilon_high if self.epsilon_high is not None else self.epsilon
+
+        # Set default GSPO fallback epsilon values if not specified
+        if self.gspo_fallback_epsilon is None:
+            self.gspo_fallback_epsilon = self.epsilon
+        if self.gspo_fallback_epsilon_high is None:
+            self.gspo_fallback_epsilon_high = self.gspo_fallback_epsilon
 
         num_processes = self.world_size
         # The current default effective batch size
