@@ -1820,15 +1820,28 @@ class GRPOTrainer(BaseTrainer):
         # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
 
         coef_1 = torch.exp(log_importance_weights)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+
+        # Symmetric clipping: only clip tokens with non-zero advantage
+        # For A=0 tokens, clipping has no effect on loss (since loss = -r*0 = 0 regardless of r)
+        # So we skip clipping them to save computation and reduce unnecessary constraints
+        advantages_expanded = advantages.unsqueeze(1)
+        is_nonzero_advantage = (advantages_expanded != 0.0)
+
+        # Apply clipping only where advantage is non-zero
+        coef_2 = torch.where(
+            is_nonzero_advantage,
+            torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high),
+            coef_1  # Keep original ratio for A=0 tokens
+        )
 
         # Two-sided clipping
         if self.args.delta is not None:
             coef_1 = torch.clamp(coef_1, max=self.args.delta)
+            coef_2 = torch.clamp(coef_2, max=self.args.delta)
 
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        # True symmetric clipping: directly use clipped coefficient without min operation
+        # This applies clipping regardless of advantage sign (different from PPO)
+        per_token_loss = -coef_2 * advantages_expanded
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
@@ -1872,9 +1885,31 @@ class GRPOTrainer(BaseTrainer):
         self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
 
         # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
-        is_region_clipped = is_low_clipped | is_high_clipped
+        # True symmetric clipping: clip detection ignores advantage sign BUT only clips non-zero advantages
+        # Note: We only actually clip tokens where A≠0, but for comparison we track what would be clipped
+        is_low_extreme = (coef_1 < 1 - self.epsilon_low)
+        is_high_extreme = (coef_1 > 1 + self.epsilon_high)
+        is_region_extreme = is_low_extreme | is_high_extreme
+
+        # Symmetric clip: extreme tokens with non-zero advantage
+        is_low_clipped_symmetric = is_low_extreme & is_nonzero_advantage
+        is_high_clipped_symmetric = is_high_extreme & is_nonzero_advantage
+        is_region_clipped_symmetric = is_low_clipped_symmetric | is_high_clipped_symmetric
+
+        # PPO-style clipping: clip detection considers advantage sign
+        is_low_clipped_ppo = (coef_1 < 1 - self.epsilon_low) & (advantages_expanded < 0)
+        is_high_clipped_ppo = (coef_1 > 1 + self.epsilon_high) & (advantages_expanded > 0)
+        is_region_clipped_ppo = is_low_clipped_ppo | is_high_clipped_ppo
+
+        # Overcorrection: tokens clipped by symmetric but not by PPO
+        is_low_overcorrected = is_low_clipped_symmetric & ~is_low_clipped_ppo
+        is_high_overcorrected = is_high_clipped_symmetric & ~is_high_clipped_ppo
+        is_overcorrected = is_low_overcorrected | is_high_overcorrected
+
+        # Use symmetric for main metrics (matching the actual training behavior)
+        is_low_clipped = is_low_clipped_symmetric
+        is_high_clipped = is_high_clipped_symmetric
+        is_region_clipped = is_region_clipped_symmetric
 
         low_clip = masked_batch_mean(is_low_clipped.float())
         high_clip = masked_batch_mean(is_high_clipped.float())
@@ -1888,6 +1923,58 @@ class GRPOTrainer(BaseTrainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+
+        # Report overcorrection metrics
+        ppo_clip_ratio = masked_batch_mean(is_region_clipped_ppo.float())
+        overcorrection_ratio = masked_batch_mean(is_overcorrected.float())
+
+        gathered_ppo_clip = self.accelerator.gather(ppo_clip_ratio)
+        gathered_overcorrection = self.accelerator.gather(overcorrection_ratio)
+
+        self._metrics[mode]["clip_ratio/ppo_style"].append(gathered_ppo_clip.nanmean().item())
+        self._metrics[mode]["clip_ratio/overcorrection"].append(gathered_overcorrection.nanmean().item())
+
+        # Percentage of overcorrection among all clipped tokens
+        # Use global ratio to avoid distributed averaging issues
+        overcorrection_pct = gathered_overcorrection.sum() / gathered_clip_ratio.sum().clamp(min=1e-8)
+        self._metrics[mode]["clip_ratio/overcorrection_pct"].append(overcorrection_pct.item())
+
+        # Advantage sign analysis for overcorrection
+        # Use direct counts instead of ratios to avoid distributed averaging issues
+        # Note: advantages_expanded is already defined above for clipping logic
+        overcorrection_pos_adv = is_overcorrected & (advantages_expanded > 0) & completion_mask.bool()
+        overcorrection_neg_adv = is_overcorrected & (advantages_expanded < 0) & completion_mask.bool()
+        overcorrection_total = is_overcorrected & completion_mask.bool()
+
+        # Gather counts from all processes
+        overcorrection_pos_count = self.accelerator.gather(overcorrection_pos_adv.sum())
+        overcorrection_neg_count = self.accelerator.gather(overcorrection_neg_adv.sum())
+        overcorrection_total_count = self.accelerator.gather(overcorrection_total.sum())
+
+        # Calculate global ratios
+        overcorrection_pos_pct = overcorrection_pos_count.sum().float() / overcorrection_total_count.sum().clamp(min=1)
+        overcorrection_neg_pct = overcorrection_neg_count.sum().float() / overcorrection_total_count.sum().clamp(min=1)
+
+        self._metrics[mode]["clip_ratio/overcorrection_pos_adv_pct"].append(overcorrection_pos_pct.item())
+        self._metrics[mode]["clip_ratio/overcorrection_neg_adv_pct"].append(overcorrection_neg_pct.item())
+
+        # Advantage sign analysis for PPO-style clipping
+        ppo_pos_adv = is_region_clipped_ppo & (advantages_expanded > 0) & completion_mask.bool()
+        ppo_neg_adv = is_region_clipped_ppo & (advantages_expanded < 0) & completion_mask.bool()
+        ppo_total = is_region_clipped_ppo & completion_mask.bool()
+
+        # Gather counts from all processes
+        ppo_pos_count = self.accelerator.gather(ppo_pos_adv.sum())
+        ppo_neg_count = self.accelerator.gather(ppo_neg_adv.sum())
+        ppo_total_count = self.accelerator.gather(ppo_total.sum())
+
+        # Calculate global ratios
+        ppo_pos_pct = ppo_pos_count.sum().float() / ppo_total_count.sum().clamp(min=1)
+        ppo_neg_pct = ppo_neg_count.sum().float() / ppo_total_count.sum().clamp(min=1)
+
+        self._metrics[mode]["clip_ratio/ppo_style_pos_adv_pct"].append(ppo_pos_pct.item())
+        self._metrics[mode]["clip_ratio/ppo_style_neg_adv_pct"].append(ppo_neg_pct.item())
+
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
